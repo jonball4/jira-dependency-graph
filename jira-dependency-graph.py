@@ -4,6 +4,7 @@ from __future__ import print_function
 
 import argparse
 import getpass
+import os
 import sys
 import textwrap
 
@@ -17,6 +18,11 @@ MAX_SUMMARY_LENGTH = 30
 def log(*args):
     print(*args, file=sys.stderr)
 
+def get_assignee_name(issue_fields):
+    assignee = issue_fields['assignee']
+    if assignee is None:
+        return 'Unassigned'
+    return assignee['displayName']
 
 class JiraSearch(object):
     """ This factory will create the actual method used to fetch issues from JIRA. This is really just a closure that
@@ -29,7 +35,8 @@ class JiraSearch(object):
         self.url = url + '/rest/api/latest'
         self.auth = auth
         self.no_verify_ssl = no_verify_ssl
-        self.fields = ','.join(['key', 'summary', 'status', 'description', 'issuetype', 'issuelinks', 'subtasks'])
+        self.fields = ','.join(['key', 'summary', 'status', 'description', 'issuetype', 'issuelinks', 'subtasks', 'assignee'])
+        self.assignee_cache = {}
 
     def get(self, uri, params={}):
         headers = {'Content-Type' : 'application/json'}
@@ -45,11 +52,26 @@ class JiraSearch(object):
     def get_issue(self, key):
         """ Given an issue key (i.e. JRA-9) return the JSON representation of it. This is the only place where we deal
             with JIRA's REST API. """
-        log('Fetching ' + key)
+        log('Fetching issue ' + key)
         # we need to expand subtasks and links since that's what we care about here.
         response = self.get('/issue/%s' % key, params={'fields': self.fields})
         response.raise_for_status()
         return response.json()
+    
+    def fetch_assignee(self, key):
+        """ Given an issue key (i.e. JRA-9) return the JSON representation of it. This is the only place where we deal
+            with JIRA's REST API. """
+        if key in self.assignee_cache:
+            log('(Cache Hit) Fetching assignee for ' + key)
+            return self.assignee_cache[key]
+        log('(Cache Miss) Fetching assignee for ' + key)
+        # we need to expand subtasks and links since that's what we care about here.
+        response = self.get('/issue/%s' % key, params={'fields': ['assignee']})
+        response.raise_for_status()
+        as_json = response.json()
+        assignee_name = get_assignee_name(as_json['fields'])
+        self.assignee_cache[key] = assignee_name
+        return assignee_name
 
     def query(self, query):
         log('Querying ' + query)
@@ -75,16 +97,22 @@ def build_graph_data(start_issue_key, jira, excludes, ignores, show_directions, 
         return issue['key']
 
     def get_status_color(status_field):
-        status = status_field['statusCategory']['name'].upper()
-        if status == 'IN PROGRESS':
+        status = status_field['name'].upper()
+        if status in ['IN PROGRESS', 'IN REVIEW', 'IN TEST', 'IN TEST REVIEW', 'READY FOR PROD', 'READY FOR TEST']:
             return 'yellow'
+        elif status == 'BLOCKED':
+            return 'red'
         elif status == 'DONE':
+            return 'green'
+        elif status in ['WON\'T FIX', 'DUPLICATE']:
             return 'green'
         return 'white'
 
     def create_node_text(issue_key, fields, islink=True):
         summary = fields['summary']
         status = fields['status']
+
+        log('Issue with key ' + issue_key + ' has status ' + status['name'])
 
         if word_wrap == True:
             if len(summary) > MAX_SUMMARY_LENGTH:
@@ -99,8 +127,9 @@ def build_graph_data(start_issue_key, jira, excludes, ignores, show_directions, 
         # log('node ' + issue_key + ' status = ' + str(status))
 
         if islink:
-            return '"{}\\n({})"'.format(issue_key, summary)
-        return '"{}\\n({})" [href="{}", fillcolor="{}", style=filled]'.format(issue_key, summary, jira.get_issue_uri(issue_key), get_status_color(status))
+            return '"{}\\n({})\\n{}"'.format(issue_key, summary, jira.fetch_assignee(issue_key))
+        assignee_name = get_assignee_name(fields)
+        return '"{}\\n({})\\n{}" [href="{}", fillcolor="{}", style=filled]'.format(issue_key, summary, assignee_name, jira.get_issue_uri(issue_key), get_status_color(status))
 
     def process_link(fields, issue_key, link):
         if 'outwardIssue' in link:
@@ -141,7 +170,7 @@ def build_graph_data(start_issue_key, jira, excludes, ignores, show_directions, 
         arrow = ' => ' if direction == 'outward' else ' <= '
         log(issue_key + arrow + link_type + arrow + linked_issue_key)
 
-        extra = ',color="red"' if link_type == "blocks" else ""
+        extra = ',color="red"' if link_type == "is blocked by" else ""
 
         if direction not in show_directions:
             node = None
@@ -287,8 +316,9 @@ def main():
         # Basic Auth is usually easier for scripts like this to deal with than Cookies.
         user = options.user if options.user is not None \
                     else input('Username: ')
-        password = options.password if options.password is not None \
-                    else getpass.getpass('Password: ')
+        password = options.password or os.environ.get('JIRA_TOKEN')
+        if password is None:
+            password = getpass.getpass('Password: ')
         auth = (user, password)
 
     jira = JiraSearch(options.jira_url, auth, options.no_verify_ssl)
